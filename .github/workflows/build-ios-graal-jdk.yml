@@ -1,0 +1,140 @@
+name: Build iOS Graal JDK 21
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: iphoneos-arm64
+            sdk: iphoneos
+            expected_platform: iphoneos
+          - target: iphonesimulator-arm64
+            sdk: iphonesimulator
+            expected_platform: iphonesimulator
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Initialize submodules
+        run: |
+          git submodule sync --recursive
+          git submodule update --init --recursive
+
+      - name: Setup Java 21 host JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install build dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
+          HOMEBREW_NO_INSTALL_CLEANUP: '1'
+        run: |
+          if ! command -v autoconf >/dev/null 2>&1; then
+            brew install autoconf
+          fi
+
+      - name: Install mx
+        run: scripts/ci/install-mx.sh
+
+      - name: Apply OpenJDK iOS patch
+        run: scripts/ci/apply-openjdk-ios-patch.sh
+
+      - name: Build iOS Graal JDK static libraries
+        run: scripts/ci/build-ios-graal-jdk.sh "${{ matrix.target }}" "${{ matrix.sdk }}"
+
+      - name: Setup GraalVM for CAP generation
+        uses: graalvm/setup-graalvm@v1
+        with:
+          distribution: graalvm-community
+          java-version: '21'
+          components: native-image
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve GRAALVM_HOME
+        run: |
+          GRAALVM_HOME=$(find labs-openjdk/labs-openjdk-21/build -path '*/images/graal-builder-image' -type d | head -n 1 || true)
+          if [ -n "$GRAALVM_HOME" ] && [ -x "$GRAALVM_HOME/bin/native-image" ]; then
+            echo "Using graal-builder-image as GRAALVM_HOME: $GRAALVM_HOME"
+          else
+            NATIVE_IMAGE_BIN="$(command -v native-image || true)"
+            if [ -z "$NATIVE_IMAGE_BIN" ]; then
+              echo "ERROR: native-image is not available on PATH after GraalVM setup" >&2
+              exit 1
+            fi
+            GRAALVM_HOME="$(cd "$(dirname "$NATIVE_IMAGE_BIN")/.." && pwd)"
+            echo "Using setup-graalvm as GRAALVM_HOME: $GRAALVM_HOME"
+          fi
+          if [ ! -x "$GRAALVM_HOME/bin/native-image" ]; then
+            echo "ERROR: native-image not found at $GRAALVM_HOME/bin/native-image" >&2
+            exit 1
+          fi
+          echo "GRAALVM_HOME=$GRAALVM_HOME" >> $GITHUB_ENV
+
+      - name: Generate CAP cache
+        run: scripts/ci/generate-cap-cache.sh "${{ matrix.target }}" "${{ matrix.sdk }}"
+        env:
+          GRAALVM_HOME: ${{ env.GRAALVM_HOME }}
+
+      - name: Verify Mach-O platform
+        run: |
+          scripts/ci/verify-macho-platform.sh "dist/${{ matrix.target }}/libjava-release.a" "${{ matrix.expected_platform }}"
+          scripts/ci/verify-macho-platform.sh "dist/${{ matrix.target }}/libjvm-release.a" "${{ matrix.expected_platform }}"
+
+      - name: Package target artifacts
+        run: scripts/ci/package-ios-graal-artifacts.sh "${{ matrix.target }}"
+
+      - name: Upload target artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-graal-jdk-21-${{ matrix.target }}
+          path: dist/ios-graal-jdk-21-${{ matrix.target }}.zip
+          if-no-files-found: error
+
+  release-assets:
+    name: Upload release asset
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Create combined zip
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find artifacts -type f -name '*.zip' -print -exec cp {} release/ \;
+          (cd release && sha256sum *.zip > SHA256SUMS.txt)
+          zip -r ios-graal-jdk-21-all-targets.zip release
+
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release upload "${{ github.event.release.tag_name }}" release/*.zip release/SHA256SUMS.txt ios-graal-jdk-21-all-targets.zip --clobber
