@@ -3,6 +3,7 @@ set -euo pipefail
 TARGET="${1:?target required}"
 SDK="${2:?sdk required}"
 MIN_IOS_VERSION="${MIN_IOS_VERSION:-15.0}"
+ENABLE_MONITORING="${ENABLE_MONITORING:-false}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 DIST="$ROOT/dist/$TARGET"
 WORK="$ROOT/build/cap-cache-generator-$TARGET"
@@ -17,6 +18,8 @@ if [ -z "$GRAALVM_HOME" ] || [ ! -x "$GRAALVM_HOME/bin/native-image" ]; then
   echo "Cannot find native-image. Set GRAALVM_HOME or build graal-builder-image first." >&2
   exit 1
 fi
+echo "CAP cache native-image: $GRAALVM_HOME/bin/native-image"
+"$GRAALVM_HOME/bin/native-image" --version
 rm -rf "$WORK"
 git clone --depth 1 https://github.com/NostrGameEngine/cap-cache-generator.git "$WORK"
 export GRAALVM_HOME
@@ -38,8 +41,56 @@ echo "CXX=$CXX"
 echo "CFLAGS=$CFLAGS"
 echo "CPPFLAGS=$CPPFLAGS"
 echo "LDFLAGS=$LDFLAGS"
+echo "ENABLE_MONITORING=$ENABLE_MONITORING"
 cd "$WORK"
-./gradlew --no-daemon generateCapCache
+./gradlew --no-daemon build
+LIBS_DIR="$WORK/build/libs"
+IOS_LIB_DIR="$LIBS_DIR/ios"
+DUMMY_JAR="$(find "$LIBS_DIR" -maxdepth 1 -name '*.jar' -type f | head -n 1 || true)"
+if [ -z "$DUMMY_JAR" ]; then
+  echo "Could not find cap-cache-generator jar under $LIBS_DIR" >&2
+  exit 1
+fi
+rm -rf "$IOS_LIB_DIR"
+mkdir -p "$IOS_LIB_DIR"
+NATIVE_IMAGE_ARGS=(
+  "$GRAALVM_HOME/bin/native-image"
+  -cp "$DUMMY_JAR"
+  --no-server
+  -H:+UnlockExperimentalVMOptions
+  -R:-UsePerfData
+  -H:+ExitAfterRelocatableImageWrite
+  -H:+SharedLibrary
+  "-H:TempDirectory=$LIBS_DIR/ios-graal-cap-cache"
+  -H:Name=usercode
+  -H:+AddAllCharsets
+  -H:-DeadlockWatchdogExitOnTimeout
+  -H:DeadlockWatchdogInterval=0
+  -H:+RemoveSaturatedTypeFlows
+  -H:-SpawnIsolates
+  -H:PageSize=16384
+  -H:EnableURLProtocols=http,https,jar
+  -H:+PrintAnalysisCallTree
+  -H:Log=registerResource:
+  -Djdk.internal.lambda.eagerlyInitialize=false
+  -H:+ReportExceptionStackTraces
+  -Dsvm.targetName=iOS
+  -Dsvm.targetArch=arm64
+  -H:CompilerBackend=lir
+  '-Dsvm.platform=org.graalvm.nativeimage.Platform$IOS_AARCH64'
+  --no-fallback
+)
+if [ "$ENABLE_MONITORING" = "true" ]; then
+  NATIVE_IMAGE_ARGS+=(--enable-monitoring=heapdump,jfr)
+fi
+NATIVE_IMAGE_ARGS+=(
+  -H:+NewCAPCache
+  -H:+ExitAfterCAPCache
+  "-H:CAPCacheDir=$IOS_LIB_DIR"
+)
+printf '%q ' "${NATIVE_IMAGE_ARGS[@]}"
+printf '\n'
+"${NATIVE_IMAGE_ARGS[@]}"
 FOUND="$(find build -path '*libs*' -name '*.cap' -type f | wc -l | tr -d ' ')"
 if [ "$FOUND" = "0" ]; then
   echo "No CAP files generated" >&2
