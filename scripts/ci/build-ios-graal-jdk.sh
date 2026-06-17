@@ -107,8 +107,10 @@ COMMON_XCODE_ARGS=(
   SYMROOT="$BUILD_ROOT/symroot"
   OBJROOT="$BUILD_ROOT/objroot"
   DSTROOT="$BUILD_ROOT/dstroot"
-  "${EXTRA_XCODE_ARGS[@]}"
 )
+if [ "${#EXTRA_XCODE_ARGS[@]}" -gt 0 ]; then
+  COMMON_XCODE_ARGS+=("${EXTRA_XCODE_ARGS[@]}")
+fi
 xcodebuild \
   -project labs-openjdk/svm.openjdk.xcodeproj \
   -target libjava \
