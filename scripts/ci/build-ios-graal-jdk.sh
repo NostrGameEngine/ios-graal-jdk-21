@@ -10,6 +10,49 @@ OPENJDK="$ROOT/labs-openjdk/labs-openjdk-21"
 DIST="$ROOT/dist/$TARGET"
 BUILD_ROOT="$ROOT/build/$TARGET"
 BOOT_JDK_DIR="$ROOT/build/boot-jdk"
+
+version_less_than() {
+  awk -v left="$1" -v right="$2" '
+    BEGIN {
+      split(left, l, ".")
+      split(right, r, ".")
+      max = (length(l) > length(r)) ? length(l) : length(r)
+      for (i = 1; i <= max; i++) {
+        lv = (i in l) ? l[i] + 0 : 0
+        rv = (i in r) ? r[i] + 0 : 0
+        if (lv < rv) exit 0
+        if (lv > rv) exit 1
+      }
+      exit 1
+    }
+  '
+}
+
+clang_supports_flag() {
+  local clang_path="$1"
+  local flag="$2"
+  local sdk_path="$3"
+  local apple_target="$4"
+  "$clang_path" \
+    -target "$apple_target" \
+    -isysroot "$sdk_path" \
+    -x objective-c++ \
+    -fsyntax-only \
+    "$flag" \
+    - >/dev/null 2>&1 </dev/null
+}
+
+append_build_setting() {
+  local name="$1"
+  local value="$2"
+  local existing="${!name:-}"
+  if [ -n "$existing" ]; then
+    printf '%s=%s %s\n' "$name" "$existing" "$value"
+  else
+    printf '%s=%s\n' "$name" "$value"
+  fi
+}
+
 mkdir -p "$DIST" "$BUILD_ROOT" "$BOOT_JDK_DIR"
 export PATH="$HOME/.mx:$PATH"
 if [ ! -x "$BOOT_JDK_DIR/jdk21/bin/java" ]; then
@@ -37,6 +80,23 @@ if [ ! -f "build/labsjdk/spec.gmk" ]; then
 fi
 make CONF_NAME=labsjdk graal-builder-image
 cd "$ROOT"
+CLANGXX="$(xcrun --sdk "$SDK" --find clang++)"
+if [ "$SDK" = "iphonesimulator" ]; then
+  APPLE_TARGET="arm64-apple-ios${MIN_IOS_VERSION}-simulator"
+else
+  APPLE_TARGET="arm64-apple-ios${MIN_IOS_VERSION}"
+fi
+EXTRA_XCODE_ARGS=()
+if version_less_than "$MIN_IOS_VERSION" "15.0" && \
+  clang_supports_flag "$CLANGXX" "-fno-objc-msgsend-selector-stubs" "$SDKROOT" "$APPLE_TARGET"; then
+  EXTRA_XCODE_ARGS+=(
+    "$(append_build_setting OTHER_CFLAGS "-fno-objc-msgsend-selector-stubs")"
+    "$(append_build_setting OTHER_CPLUSPLUSFLAGS "-fno-objc-msgsend-selector-stubs")"
+  )
+fi
+if [ "${#EXTRA_XCODE_ARGS[@]}" -gt 0 ]; then
+  echo "Extra Xcode compiler flags: ${EXTRA_XCODE_ARGS[*]}"
+fi
 COMMON_XCODE_ARGS=(
   ARCHS="$ARCH"
   ONLY_ACTIVE_ARCH=NO
@@ -47,6 +107,7 @@ COMMON_XCODE_ARGS=(
   SYMROOT="$BUILD_ROOT/symroot"
   OBJROOT="$BUILD_ROOT/objroot"
   DSTROOT="$BUILD_ROOT/dstroot"
+  "${EXTRA_XCODE_ARGS[@]}"
 )
 xcodebuild \
   -project labs-openjdk/svm.openjdk.xcodeproj \
